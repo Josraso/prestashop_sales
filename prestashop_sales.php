@@ -32,6 +32,19 @@ $date_type = isset($_POST['date_type']) ? $_POST['date_type'] : 'last_state';
 $view_mode = isset($_POST['view_mode']) ? $_POST['view_mode'] : 'grouped'; // 'grouped' o 'detailed'
 $export = isset($_POST['export']) ? true : false;
 
+// Paginación y ordenamiento
+$page = isset($_GET['page']) ? max(1, intval($_GET['page'])) : 1;
+$limit = isset($_POST['limit']) ? intval($_POST['limit']) : 100;
+$order_by = isset($_GET['order_by']) ? $_GET['order_by'] : '';
+$order_dir = isset($_GET['order_dir']) && $_GET['order_dir'] === 'DESC' ? 'DESC' : 'ASC';
+
+// Validar límite
+if (!in_array($limit, [50, 100, 200, 500])) {
+    $limit = 100;
+}
+
+$offset = ($page - 1) * $limit;
+
 // Obtener años disponibles
 $stmt_years = $pdo->prepare("SELECT DISTINCT YEAR(date_add) AS year FROM {$db_prefix}orders ORDER BY year DESC");
 $stmt_years->execute();
@@ -41,9 +54,66 @@ $available_years = $stmt_years->fetchAll(PDO::FETCH_COLUMN);
 $where = [];
 $params = [];
 
+// Construir la base común de las consultas
+$base_from = "FROM {$db_prefix}order_detail od
+    INNER JOIN {$db_prefix}orders o ON od.id_order = o.id_order
+    INNER JOIN {$db_prefix}product p ON od.product_id = p.id_product
+    INNER JOIN {$db_prefix}product_lang pl ON p.id_product = pl.id_product AND pl.id_lang = 1
+    INNER JOIN {$db_prefix}order_history oh ON oh.id_order = o.id_order";
+
+if ($view_mode === 'detailed') {
+    $base_from .= " LEFT JOIN {$db_prefix}order_state_lang osl ON o.current_state = osl.id_order_state AND osl.id_lang = 1";
+}
+
+// Subconsulta para obtener la fecha del estado actual de cada pedido
+$where[] = "oh.date_add = (
+    SELECT MAX(oh2.date_add)
+    FROM {$db_prefix}order_history oh2
+    WHERE oh2.id_order = o.id_order
+    AND oh2.id_order_state = o.current_state
+)";
+
+// Filtrar por estados si están seleccionados
+if (!empty($selected_states)) {
+    $placeholders = implode(',', array_fill(0, count($selected_states), '?'));
+    $where[] = "o.current_state IN ($placeholders)";
+    $params = array_merge($params, $selected_states);
+}
+
+// Filtrar por producto si hay búsqueda
+if (!empty($search_product)) {
+    $where[] = "(pl.name LIKE ? OR p.reference LIKE ?)";
+    $params[] = "%$search_product%";
+    $params[] = "%$search_product%";
+}
+
+// Filtrar por años si están seleccionados
+if (!empty($selected_years)) {
+    $placeholders_years = implode(',', array_fill(0, count($selected_years), '?'));
+    if ($date_type === 'order_date') {
+        $where[] = "YEAR(o.date_add) IN ($placeholders_years)";
+    } else {
+        $where[] = "YEAR(oh.date_add) IN ($placeholders_years)";
+    }
+    $params = array_merge($params, $selected_years);
+}
+
+$where_clause = !empty($where) ? " WHERE " . implode(' AND ', $where) : "";
+
 // Construir consulta SQL según el modo de vista
 if ($view_mode === 'detailed') {
     // VISTA DETALLADA: Muestra cada pedido individual con su ID
+
+    // Primero contar total de registros
+    $sql_count = "SELECT COUNT(*) as total
+        $base_from
+        $where_clause";
+
+    $stmt_count = $pdo->prepare($sql_count);
+    $stmt_count->execute($params);
+    $total_records = $stmt_count->fetch(PDO::FETCH_ASSOC)['total'];
+
+    // Consulta principal con paginación
     $sql = "SELECT
         o.id_order,
         COALESCE(NULLIF(p.reference, ''), pl.name) AS referencia,
@@ -55,109 +125,93 @@ if ($view_mode === 'detailed') {
         oh.date_add AS fecha_ultimo_estado,
         od.product_quantity AS cantidad_vendida,
         osl.name AS estado_pedido
-    FROM {$db_prefix}order_detail od
-    INNER JOIN {$db_prefix}orders o ON od.id_order = o.id_order
-    INNER JOIN {$db_prefix}product p ON od.product_id = p.id_product
-    INNER JOIN {$db_prefix}product_lang pl ON p.id_product = pl.id_product AND pl.id_lang = 1
-    INNER JOIN {$db_prefix}order_history oh ON oh.id_order = o.id_order
-    LEFT JOIN {$db_prefix}order_state_lang osl ON o.current_state = osl.id_order_state AND osl.id_lang = 1";
+    $base_from
+    $where_clause";
 
-    // Subconsulta para obtener la fecha del estado actual de cada pedido
-    $where[] = "oh.date_add = (
-        SELECT MAX(oh2.date_add)
-        FROM {$db_prefix}order_history oh2
-        WHERE oh2.id_order = o.id_order
-        AND oh2.id_order_state = o.current_state
-    )";
+    // Ordenamiento dinámico
+    $valid_columns_detailed = ['id_order' => 'o.id_order', 'referencia' => 'referencia', 'nombre_producto' => 'pl.name',
+                                'fecha_creacion_pedido' => 'o.date_add', 'fecha_ultimo_estado' => 'oh.date_add',
+                                'año' => 'año', 'cantidad_vendida' => 'od.product_quantity', 'estado_pedido' => 'osl.name'];
 
-    // Filtrar por estados si están seleccionados
-    if (!empty($selected_states)) {
-        $placeholders = implode(',', array_fill(0, count($selected_states), '?'));
-        $where[] = "o.current_state IN ($placeholders)";
-        $params = array_merge($params, $selected_states);
+    if (!empty($order_by) && isset($valid_columns_detailed[$order_by])) {
+        $sql .= " ORDER BY " . $valid_columns_detailed[$order_by] . " $order_dir";
+    } else {
+        $sql .= " ORDER BY o.id_order DESC";
     }
 
-    // Filtrar por producto si hay búsqueda
-    if (!empty($search_product)) {
-        $where[] = "(pl.name LIKE ? OR p.reference LIKE ?)";
-        $params[] = "%$search_product%";
-        $params[] = "%$search_product%";
-    }
-
-    // Filtrar por años si están seleccionados
-    if (!empty($selected_years)) {
-        $placeholders_years = implode(',', array_fill(0, count($selected_years), '?'));
-        if ($date_type === 'order_date') {
-            $where[] = "YEAR(o.date_add) IN ($placeholders_years)";
-        } else {
-            $where[] = "YEAR(oh.date_add) IN ($placeholders_years)";
-        }
-        $params = array_merge($params, $selected_years);
-    }
-
-    if (!empty($where)) {
-        $sql .= " WHERE " . implode(' AND ', $where);
-    }
-
-    $sql .= " ORDER BY o.id_order DESC, pl.name ASC";
+    $sql .= " LIMIT $limit OFFSET $offset";
 
 } else {
     // VISTA AGRUPADA: Agrupa por producto y año
+
+    // Primero contar total de registros (grupos)
+    $sql_count = "SELECT COUNT(*) as total FROM (
+        SELECT
+            COALESCE(NULLIF(p.reference, ''), pl.name) AS referencia,
+            " . ($date_type === 'order_date' ? 'YEAR(o.date_add)' : 'YEAR(oh.date_add)') . " AS año
+        $base_from
+        $where_clause
+        GROUP BY COALESCE(NULLIF(p.reference, ''), pl.name), pl.name, año
+    ) AS subquery";
+
+    $stmt_count = $pdo->prepare($sql_count);
+    $stmt_count->execute($params);
+    $total_records = $stmt_count->fetch(PDO::FETCH_ASSOC)['total'];
+
+    // Consulta principal con paginación
     $sql = "SELECT
         COALESCE(NULLIF(p.reference, ''), pl.name) AS referencia,
         pl.name AS nombre_producto,
         " . ($date_type === 'order_date' ? 'YEAR(o.date_add)' : 'YEAR(oh.date_add)') . " AS año,
         SUM(od.product_quantity) AS cantidad_vendida
-    FROM {$db_prefix}order_detail od
-    INNER JOIN {$db_prefix}orders o ON od.id_order = o.id_order
-    INNER JOIN {$db_prefix}product p ON od.product_id = p.id_product
-    INNER JOIN {$db_prefix}product_lang pl ON p.id_product = pl.id_product AND pl.id_lang = 1
-    INNER JOIN {$db_prefix}order_history oh ON oh.id_order = o.id_order";
+    $base_from
+    $where_clause
+    GROUP BY COALESCE(NULLIF(p.reference, ''), pl.name), pl.name, año";
 
-    // Subconsulta para obtener la fecha del estado actual de cada pedido
-    $where[] = "oh.date_add = (
-        SELECT MAX(oh2.date_add)
-        FROM {$db_prefix}order_history oh2
-        WHERE oh2.id_order = o.id_order
-        AND oh2.id_order_state = o.current_state
-    )";
+    // Ordenamiento dinámico
+    $valid_columns_grouped = ['referencia' => 'referencia', 'nombre_producto' => 'nombre_producto',
+                              'año' => 'año', 'cantidad_vendida' => 'cantidad_vendida'];
 
-    // Filtrar por estados si están seleccionados
-    if (!empty($selected_states)) {
-        $placeholders = implode(',', array_fill(0, count($selected_states), '?'));
-        $where[] = "o.current_state IN ($placeholders)";
-        $params = array_merge($params, $selected_states);
+    if (!empty($order_by) && isset($valid_columns_grouped[$order_by])) {
+        $sql .= " ORDER BY " . $valid_columns_grouped[$order_by] . " $order_dir";
+    } else {
+        $sql .= " ORDER BY año DESC, cantidad_vendida DESC";
     }
 
-    // Filtrar por producto si hay búsqueda
-    if (!empty($search_product)) {
-        $where[] = "(pl.name LIKE ? OR p.reference LIKE ?)";
-        $params[] = "%$search_product%";
-        $params[] = "%$search_product%";
-    }
-
-    // Filtrar por años si están seleccionados
-    if (!empty($selected_years)) {
-        $placeholders_years = implode(',', array_fill(0, count($selected_years), '?'));
-        if ($date_type === 'order_date') {
-            $where[] = "YEAR(o.date_add) IN ($placeholders_years)";
-        } else {
-            $where[] = "YEAR(oh.date_add) IN ($placeholders_years)";
-        }
-        $params = array_merge($params, $selected_years);
-    }
-
-    if (!empty($where)) {
-        $sql .= " WHERE " . implode(' AND ', $where);
-    }
-
-    $sql .= " GROUP BY COALESCE(NULLIF(p.reference, ''), pl.name), pl.name, año
-              ORDER BY año DESC, cantidad_vendida DESC";
+    $sql .= " LIMIT $limit OFFSET $offset";
 }
 
 $stmt = $pdo->prepare($sql);
 $stmt->execute($params);
 $results = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+// Calcular total de páginas
+$total_pages = ceil($total_records / $limit);
+
+// Función para generar URL de ordenamiento
+function getSortUrl($column) {
+    global $order_by, $order_dir;
+    $params = $_GET;
+    $params['order_by'] = $column;
+
+    // Si ya está ordenando por esta columna, invertir la dirección
+    if ($order_by === $column) {
+        $params['order_dir'] = ($order_dir === 'ASC') ? 'DESC' : 'ASC';
+    } else {
+        $params['order_dir'] = 'ASC';
+    }
+
+    return '?' . http_build_query($params);
+}
+
+// Función para obtener el icono de ordenamiento
+function getSortIcon($column) {
+    global $order_by, $order_dir;
+    if ($order_by === $column) {
+        return $order_dir === 'ASC' ? ' ▲' : ' ▼';
+    }
+    return ' ⇅';
+}
 
 // Exportar a Excel
 if ($export && !empty($results)) {
@@ -405,6 +459,20 @@ if ($export && !empty($results)) {
             text-align: left;
             font-weight: 600;
         }
+        th a {
+            color: white;
+            text-decoration: none;
+            display: block;
+            width: 100%;
+            transition: opacity 0.2s;
+        }
+        th a:hover {
+            opacity: 0.8;
+        }
+        th.sortable {
+            cursor: pointer;
+            user-select: none;
+        }
         td {
             padding: 12px 15px;
             border-bottom: 1px solid #ddd;
@@ -445,6 +513,58 @@ if ($export && !empty($results)) {
         .stat-card .value {
             font-size: 28px;
             font-weight: bold;
+        }
+        .pagination-container {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-top: 20px;
+            padding: 20px;
+            background: #f8f9fa;
+            border-radius: 5px;
+            flex-wrap: wrap;
+            gap: 15px;
+        }
+        .pagination-info {
+            color: #555;
+            font-size: 14px;
+        }
+        .pagination {
+            display: flex;
+            gap: 5px;
+            list-style: none;
+            padding: 0;
+            margin: 0;
+        }
+        .pagination a, .pagination span {
+            padding: 8px 12px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            text-decoration: none;
+            color: #007bff;
+            background: white;
+            transition: all 0.2s;
+        }
+        .pagination a:hover {
+            background: #007bff;
+            color: white;
+            border-color: #007bff;
+        }
+        .pagination .current {
+            background: #007bff;
+            color: white;
+            border-color: #007bff;
+            font-weight: bold;
+        }
+        .pagination .disabled {
+            color: #999;
+            cursor: not-allowed;
+            background: #f8f9fa;
+        }
+        .pagination .disabled:hover {
+            background: #f8f9fa;
+            color: #999;
+            border-color: #ddd;
         }
     </style>
     <script>
@@ -536,11 +656,15 @@ if ($export && !empty($results)) {
                                 🔍 Vista Detallada por Pedido (muestra ID de cada pedido)
                             </option>
                         </select>
-                        <div style="margin-top: 8px; padding: 10px; background: #fff3cd; border-left: 3px solid #ffc107; font-size: 12px; border-radius: 3px;">
-                            <strong>ℹ️ Diferencia:</strong>
-                            <strong>Vista Agrupada</strong> suma todas las unidades del mismo producto en el mismo año.
-                            <strong>Vista Detallada</strong> muestra cada pedido individual con su ID para que puedas verificar los datos.
-                        </div>
+                    </div>
+                    <div class="filter-group">
+                        <label for="limit">📄 Resultados por Página:</label>
+                        <select id="limit" name="limit" style="width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px; background: white;">
+                            <option value="50" <?php echo $limit == 50 ? 'selected' : ''; ?>>50 resultados</option>
+                            <option value="100" <?php echo $limit == 100 ? 'selected' : ''; ?>>100 resultados</option>
+                            <option value="200" <?php echo $limit == 200 ? 'selected' : ''; ?>>200 resultados</option>
+                            <option value="500" <?php echo $limit == 500 ? 'selected' : ''; ?>>500 resultados</option>
+                        </select>
                     </div>
                 </div>
 
@@ -554,24 +678,54 @@ if ($export && !empty($results)) {
         
         <?php if (!empty($results)): ?>
             <?php
-            // Calcular estadísticas
-            $total_productos = count($results);
-            $total_cantidad = array_sum(array_column($results, 'cantidad_vendida'));
+            // Calcular estadísticas de la página actual
+            $total_productos_pagina = count($results);
+            $total_cantidad_pagina = array_sum(array_column($results, 'cantidad_vendida'));
             $años = array_unique(array_column($results, 'año'));
+
+            // Calcular totales generales (todas las páginas)
+            $sql_totals = "SELECT
+                COUNT(" . ($view_mode === 'detailed' ? '*' : 'DISTINCT COALESCE(NULLIF(p.reference, \'\'), pl.name)') . ") as total_productos,
+                SUM(od.product_quantity) as total_cantidad
+            $base_from
+            $where_clause";
+
+            if ($view_mode === 'grouped') {
+                // Para vista agrupada, necesitamos contar grupos únicos
+                $sql_totals = "SELECT
+                    COUNT(DISTINCT CONCAT(COALESCE(NULLIF(p.reference, ''), pl.name), '-', " . ($date_type === 'order_date' ? 'YEAR(o.date_add)' : 'YEAR(oh.date_add)') . ")) as total_productos,
+                    SUM(od.product_quantity) as total_cantidad
+                $base_from
+                $where_clause";
+            }
+
+            $stmt_totals = $pdo->prepare($sql_totals);
+            $stmt_totals->execute($params);
+            $totals = $stmt_totals->fetch(PDO::FETCH_ASSOC);
+            $total_cantidad = $totals['total_cantidad'];
             ?>
             
             <div class="stats">
                 <div class="stat-card">
-                    <h3>Total Productos</h3>
-                    <div class="value"><?php echo $total_productos; ?></div>
+                    <h3>Total Registros</h3>
+                    <div class="value"><?php echo number_format($total_records, 0, ',', '.'); ?></div>
+                    <div style="font-size: 12px; opacity: 0.8; margin-top: 5px;">
+                        (<?php echo $total_productos_pagina; ?> en esta página)
+                    </div>
                 </div>
                 <div class="stat-card" style="background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);">
-                    <h3>Unidades Vendidas</h3>
+                    <h3>Unidades Vendidas (Total)</h3>
                     <div class="value"><?php echo number_format($total_cantidad, 0, ',', '.'); ?></div>
+                    <div style="font-size: 12px; opacity: 0.8; margin-top: 5px;">
+                        (<?php echo number_format($total_cantidad_pagina, 0, ',', '.'); ?> en esta página)
+                    </div>
                 </div>
                 <div class="stat-card" style="background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);">
-                    <h3>Años Analizados</h3>
-                    <div class="value"><?php echo count($años); ?></div>
+                    <h3>Página Actual</h3>
+                    <div class="value"><?php echo $page; ?> / <?php echo $total_pages; ?></div>
+                    <div style="font-size: 12px; opacity: 0.8; margin-top: 5px;">
+                        <?php echo $limit; ?> resultados por página
+                    </div>
                 </div>
             </div>
             
@@ -579,19 +733,19 @@ if ($export && !empty($results)) {
                 <thead>
                     <tr>
                         <?php if ($view_mode === 'detailed'): ?>
-                            <th>ID Pedido</th>
-                            <th>Referencia</th>
-                            <th>Nombre del Producto</th>
-                            <th>Fecha Creación</th>
-                            <th>Fecha Último Estado</th>
-                            <th>Estado</th>
-                            <th>Año (<?php echo $date_type === 'order_date' ? 'Creación' : 'Estado'; ?>)</th>
-                            <th>Cantidad</th>
+                            <th class="sortable"><a href="<?php echo getSortUrl('id_order'); ?>">ID Pedido<?php echo getSortIcon('id_order'); ?></a></th>
+                            <th class="sortable"><a href="<?php echo getSortUrl('referencia'); ?>">Referencia<?php echo getSortIcon('referencia'); ?></a></th>
+                            <th class="sortable"><a href="<?php echo getSortUrl('nombre_producto'); ?>">Nombre del Producto<?php echo getSortIcon('nombre_producto'); ?></a></th>
+                            <th class="sortable"><a href="<?php echo getSortUrl('fecha_creacion_pedido'); ?>">Fecha Creación<?php echo getSortIcon('fecha_creacion_pedido'); ?></a></th>
+                            <th class="sortable"><a href="<?php echo getSortUrl('fecha_ultimo_estado'); ?>">Fecha Último Estado<?php echo getSortIcon('fecha_ultimo_estado'); ?></a></th>
+                            <th class="sortable"><a href="<?php echo getSortUrl('estado_pedido'); ?>">Estado<?php echo getSortIcon('estado_pedido'); ?></a></th>
+                            <th class="sortable"><a href="<?php echo getSortUrl('año'); ?>">Año (<?php echo $date_type === 'order_date' ? 'Creación' : 'Estado'; ?>)<?php echo getSortIcon('año'); ?></a></th>
+                            <th class="sortable"><a href="<?php echo getSortUrl('cantidad_vendida'); ?>">Cantidad<?php echo getSortIcon('cantidad_vendida'); ?></a></th>
                         <?php else: ?>
-                            <th>Referencia</th>
-                            <th>Nombre del Producto</th>
-                            <th>Año (<?php echo $date_type === 'order_date' ? 'Creación' : 'Estado'; ?>)</th>
-                            <th>Cantidad Total</th>
+                            <th class="sortable"><a href="<?php echo getSortUrl('referencia'); ?>">Referencia<?php echo getSortIcon('referencia'); ?></a></th>
+                            <th class="sortable"><a href="<?php echo getSortUrl('nombre_producto'); ?>">Nombre del Producto<?php echo getSortIcon('nombre_producto'); ?></a></th>
+                            <th class="sortable"><a href="<?php echo getSortUrl('año'); ?>">Año (<?php echo $date_type === 'order_date' ? 'Creación' : 'Estado'; ?>)<?php echo getSortIcon('año'); ?></a></th>
+                            <th class="sortable"><a href="<?php echo getSortUrl('cantidad_vendida'); ?>">Cantidad Total<?php echo getSortIcon('cantidad_vendida'); ?></a></th>
                         <?php endif; ?>
                     </tr>
                 </thead>
@@ -631,11 +785,91 @@ if ($export && !empty($results)) {
                         </tr>
                     <?php endforeach; ?>
                     <tr class="total-row">
-                        <td colspan="<?php echo $view_mode === 'detailed' ? '7' : '3'; ?>"><strong>TOTAL</strong></td>
-                        <td><strong><?php echo number_format($total_cantidad, 0, ',', '.'); ?></strong></td>
+                        <td colspan="<?php echo $view_mode === 'detailed' ? '7' : '3'; ?>">
+                            <strong>TOTAL DE ESTA PÁGINA</strong>
+                            <span style="font-size: 11px; font-weight: normal; margin-left: 10px;">
+                                (Total general: <?php echo number_format($total_cantidad, 0, ',', '.'); ?> unidades)
+                            </span>
+                        </td>
+                        <td><strong><?php echo number_format($total_cantidad_pagina, 0, ',', '.'); ?></strong></td>
                     </tr>
                 </tbody>
             </table>
+
+            <!-- Paginación -->
+            <?php if ($total_pages > 1): ?>
+                <div class="pagination-container">
+                    <div class="pagination-info">
+                        <strong>Mostrando <?php echo number_format(($page - 1) * $limit + 1, 0, ',', '.'); ?> - <?php echo number_format(min($page * $limit, $total_records), 0, ',', '.'); ?></strong>
+                        de <strong><?php echo number_format($total_records, 0, ',', '.'); ?></strong> resultados
+                        (Página <?php echo $page; ?> de <?php echo $total_pages; ?>)
+                    </div>
+                    <div class="pagination">
+                        <?php
+                        // Construir parámetros para paginación
+                        $pagination_params = $_GET;
+
+                        // Botón anterior
+                        if ($page > 1):
+                            $pagination_params['page'] = $page - 1;
+                        ?>
+                            <a href="?<?php echo http_build_query($pagination_params); ?>">&laquo; Anterior</a>
+                        <?php else: ?>
+                            <span class="disabled">&laquo; Anterior</span>
+                        <?php endif; ?>
+
+                        <?php
+                        // Calcular rango de páginas a mostrar
+                        $range = 2; // Páginas antes y después de la actual
+                        $start = max(1, $page - $range);
+                        $end = min($total_pages, $page + $range);
+
+                        // Primera página
+                        if ($start > 1):
+                            $pagination_params['page'] = 1;
+                        ?>
+                            <a href="?<?php echo http_build_query($pagination_params); ?>">1</a>
+                            <?php if ($start > 2): ?>
+                                <span class="disabled">...</span>
+                            <?php endif; ?>
+                        <?php endif; ?>
+
+                        <?php
+                        // Páginas intermedias
+                        for ($i = $start; $i <= $end; $i++):
+                            if ($i == $page): ?>
+                                <span class="current"><?php echo $i; ?></span>
+                            <?php else:
+                                $pagination_params['page'] = $i;
+                            ?>
+                                <a href="?<?php echo http_build_query($pagination_params); ?>"><?php echo $i; ?></a>
+                            <?php endif;
+                        endfor; ?>
+
+                        <?php
+                        // Última página
+                        if ($end < $total_pages):
+                            if ($end < $total_pages - 1): ?>
+                                <span class="disabled">...</span>
+                            <?php endif;
+                            $pagination_params['page'] = $total_pages;
+                        ?>
+                            <a href="?<?php echo http_build_query($pagination_params); ?>"><?php echo $total_pages; ?></a>
+                        <?php endif; ?>
+
+                        <?php
+                        // Botón siguiente
+                        if ($page < $total_pages):
+                            $pagination_params['page'] = $page + 1;
+                        ?>
+                            <a href="?<?php echo http_build_query($pagination_params); ?>">Siguiente &raquo;</a>
+                        <?php else: ?>
+                            <span class="disabled">Siguiente &raquo;</span>
+                        <?php endif; ?>
+                    </div>
+                </div>
+            <?php endif; ?>
+
         <?php elseif ($_SERVER['REQUEST_METHOD'] === 'POST'): ?>
             <div class="no-results">
                 ❌ No se encontraron resultados con los filtros aplicados
