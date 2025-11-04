@@ -29,6 +29,7 @@ $selected_states = isset($_POST['states']) ? $_POST['states'] : [];
 $search_product = isset($_POST['search_product']) ? trim($_POST['search_product']) : '';
 $selected_years = isset($_POST['years']) ? $_POST['years'] : [];
 $date_type = isset($_POST['date_type']) ? $_POST['date_type'] : 'last_state';
+$view_mode = isset($_POST['view_mode']) ? $_POST['view_mode'] : 'grouped'; // 'grouped' o 'detailed'
 $export = isset($_POST['export']) ? true : false;
 
 // Obtener años disponibles
@@ -40,61 +41,119 @@ $available_years = $stmt_years->fetchAll(PDO::FETCH_COLUMN);
 $where = [];
 $params = [];
 
-// Construir consulta SQL - SIEMPRE mostrar ambas fechas para transparencia
-$sql = "SELECT
-    COALESCE(NULLIF(p.reference, ''), pl.name) AS referencia,
-    pl.name AS nombre_producto,
-    YEAR(o.date_add) AS año_creacion,
-    YEAR(oh.date_add) AS año_estado,
-    " . ($date_type === 'order_date' ? 'YEAR(o.date_add)' : 'YEAR(oh.date_add)') . " AS año,
-    o.date_add AS fecha_creacion_pedido,
-    oh.date_add AS fecha_ultimo_estado,
-    SUM(od.product_quantity) AS cantidad_vendida
-FROM {$db_prefix}order_detail od
-INNER JOIN {$db_prefix}orders o ON od.id_order = o.id_order
-INNER JOIN {$db_prefix}product p ON od.product_id = p.id_product
-INNER JOIN {$db_prefix}product_lang pl ON p.id_product = pl.id_product AND pl.id_lang = 1
-INNER JOIN {$db_prefix}order_history oh ON oh.id_order = o.id_order";
+// Construir consulta SQL según el modo de vista
+if ($view_mode === 'detailed') {
+    // VISTA DETALLADA: Muestra cada pedido individual con su ID
+    $sql = "SELECT
+        o.id_order,
+        COALESCE(NULLIF(p.reference, ''), pl.name) AS referencia,
+        pl.name AS nombre_producto,
+        YEAR(o.date_add) AS año_creacion,
+        YEAR(oh.date_add) AS año_estado,
+        " . ($date_type === 'order_date' ? 'YEAR(o.date_add)' : 'YEAR(oh.date_add)') . " AS año,
+        o.date_add AS fecha_creacion_pedido,
+        oh.date_add AS fecha_ultimo_estado,
+        od.product_quantity AS cantidad_vendida,
+        osl.name AS estado_pedido
+    FROM {$db_prefix}order_detail od
+    INNER JOIN {$db_prefix}orders o ON od.id_order = o.id_order
+    INNER JOIN {$db_prefix}product p ON od.product_id = p.id_product
+    INNER JOIN {$db_prefix}product_lang pl ON p.id_product = pl.id_product AND pl.id_lang = 1
+    INNER JOIN {$db_prefix}order_history oh ON oh.id_order = o.id_order
+    LEFT JOIN {$db_prefix}order_state_lang osl ON o.current_state = osl.id_order_state AND osl.id_lang = 1";
 
-// Subconsulta para obtener la fecha del estado actual de cada pedido
-$where[] = "oh.date_add = (
-    SELECT MAX(oh2.date_add)
-    FROM {$db_prefix}order_history oh2
-    WHERE oh2.id_order = o.id_order
-    AND oh2.id_order_state = o.current_state
-)";
+    // Subconsulta para obtener la fecha del estado actual de cada pedido
+    $where[] = "oh.date_add = (
+        SELECT MAX(oh2.date_add)
+        FROM {$db_prefix}order_history oh2
+        WHERE oh2.id_order = o.id_order
+        AND oh2.id_order_state = o.current_state
+    )";
 
-// Filtrar por estados si están seleccionados
-if (!empty($selected_states)) {
-    $placeholders = implode(',', array_fill(0, count($selected_states), '?'));
-    $where[] = "o.current_state IN ($placeholders)";
-    $params = array_merge($params, $selected_states);
-}
-
-// Filtrar por producto si hay búsqueda
-if (!empty($search_product)) {
-    $where[] = "(pl.name LIKE ? OR p.reference LIKE ?)";
-    $params[] = "%$search_product%";
-    $params[] = "%$search_product%";
-}
-
-// Filtrar por años si están seleccionados (ahora filtra por el tipo de fecha seleccionado)
-if (!empty($selected_years)) {
-    $placeholders_years = implode(',', array_fill(0, count($selected_years), '?'));
-    if ($date_type === 'order_date') {
-        $where[] = "YEAR(o.date_add) IN ($placeholders_years)";
-    } else {
-        $where[] = "YEAR(oh.date_add) IN ($placeholders_years)";
+    // Filtrar por estados si están seleccionados
+    if (!empty($selected_states)) {
+        $placeholders = implode(',', array_fill(0, count($selected_states), '?'));
+        $where[] = "o.current_state IN ($placeholders)";
+        $params = array_merge($params, $selected_states);
     }
-    $params = array_merge($params, $selected_years);
-}
 
-if (!empty($where)) {
-    $sql .= " WHERE " . implode(' AND ', $where);
-}
+    // Filtrar por producto si hay búsqueda
+    if (!empty($search_product)) {
+        $where[] = "(pl.name LIKE ? OR p.reference LIKE ?)";
+        $params[] = "%$search_product%";
+        $params[] = "%$search_product%";
+    }
 
-$sql .= " GROUP BY COALESCE(NULLIF(p.reference, ''), pl.name), pl.name, YEAR(o.date_add), YEAR(oh.date_add), o.date_add, oh.date_add
-          ORDER BY año DESC, cantidad_vendida DESC";
+    // Filtrar por años si están seleccionados
+    if (!empty($selected_years)) {
+        $placeholders_years = implode(',', array_fill(0, count($selected_years), '?'));
+        if ($date_type === 'order_date') {
+            $where[] = "YEAR(o.date_add) IN ($placeholders_years)";
+        } else {
+            $where[] = "YEAR(oh.date_add) IN ($placeholders_years)";
+        }
+        $params = array_merge($params, $selected_years);
+    }
+
+    if (!empty($where)) {
+        $sql .= " WHERE " . implode(' AND ', $where);
+    }
+
+    $sql .= " ORDER BY o.id_order DESC, pl.name ASC";
+
+} else {
+    // VISTA AGRUPADA: Agrupa por producto y año
+    $sql = "SELECT
+        COALESCE(NULLIF(p.reference, ''), pl.name) AS referencia,
+        pl.name AS nombre_producto,
+        " . ($date_type === 'order_date' ? 'YEAR(o.date_add)' : 'YEAR(oh.date_add)') . " AS año,
+        SUM(od.product_quantity) AS cantidad_vendida
+    FROM {$db_prefix}order_detail od
+    INNER JOIN {$db_prefix}orders o ON od.id_order = o.id_order
+    INNER JOIN {$db_prefix}product p ON od.product_id = p.id_product
+    INNER JOIN {$db_prefix}product_lang pl ON p.id_product = pl.id_product AND pl.id_lang = 1
+    INNER JOIN {$db_prefix}order_history oh ON oh.id_order = o.id_order";
+
+    // Subconsulta para obtener la fecha del estado actual de cada pedido
+    $where[] = "oh.date_add = (
+        SELECT MAX(oh2.date_add)
+        FROM {$db_prefix}order_history oh2
+        WHERE oh2.id_order = o.id_order
+        AND oh2.id_order_state = o.current_state
+    )";
+
+    // Filtrar por estados si están seleccionados
+    if (!empty($selected_states)) {
+        $placeholders = implode(',', array_fill(0, count($selected_states), '?'));
+        $where[] = "o.current_state IN ($placeholders)";
+        $params = array_merge($params, $selected_states);
+    }
+
+    // Filtrar por producto si hay búsqueda
+    if (!empty($search_product)) {
+        $where[] = "(pl.name LIKE ? OR p.reference LIKE ?)";
+        $params[] = "%$search_product%";
+        $params[] = "%$search_product%";
+    }
+
+    // Filtrar por años si están seleccionados
+    if (!empty($selected_years)) {
+        $placeholders_years = implode(',', array_fill(0, count($selected_years), '?'));
+        if ($date_type === 'order_date') {
+            $where[] = "YEAR(o.date_add) IN ($placeholders_years)";
+        } else {
+            $where[] = "YEAR(oh.date_add) IN ($placeholders_years)";
+        }
+        $params = array_merge($params, $selected_years);
+    }
+
+    if (!empty($where)) {
+        $sql .= " WHERE " . implode(' AND ', $where);
+    }
+
+    $sql .= " GROUP BY COALESCE(NULLIF(p.reference, ''), pl.name), pl.name, año
+              ORDER BY año DESC, cantidad_vendida DESC";
+}
 
 $stmt = $pdo->prepare($sql);
 $stmt->execute($params);
@@ -106,34 +165,52 @@ if ($export && !empty($results)) {
     header('Content-Disposition: attachment; filename=ventas_productos_' . date('Y-m-d') . '.xls');
     header('Pragma: no-cache');
     header('Expires: 0');
-    
+
     echo "\xEF\xBB\xBF"; // BOM para UTF-8
-    
+
     // Crear tabla HTML para Excel
     echo '<table border="1">';
     echo '<thead>';
     echo '<tr>';
-    echo '<th>Referencia</th>';
-    echo '<th>Nombre Producto</th>';
-    echo '<th>Fecha Creación Pedido</th>';
-    echo '<th>Fecha Último Estado</th>';
-    echo '<th>Año (Agrupación)</th>';
-    echo '<th>Cantidad Vendida</th>';
+    if ($view_mode === 'detailed') {
+        echo '<th>ID Pedido</th>';
+        echo '<th>Referencia</th>';
+        echo '<th>Nombre Producto</th>';
+        echo '<th>Fecha Creación Pedido</th>';
+        echo '<th>Fecha Último Estado</th>';
+        echo '<th>Estado</th>';
+        echo '<th>Año (' . ($date_type === 'order_date' ? 'Creación' : 'Estado') . ')</th>';
+        echo '<th>Cantidad</th>';
+    } else {
+        echo '<th>Referencia</th>';
+        echo '<th>Nombre Producto</th>';
+        echo '<th>Año (' . ($date_type === 'order_date' ? 'Creación' : 'Estado') . ')</th>';
+        echo '<th>Cantidad Total</th>';
+    }
     echo '</tr>';
     echo '</thead>';
     echo '<tbody>';
 
     foreach ($results as $row) {
         echo '<tr>';
-        echo '<td>' . htmlspecialchars($row['referencia']) . '</td>';
-        echo '<td>' . htmlspecialchars($row['nombre_producto']) . '</td>';
-        echo '<td>' . date('d/m/Y', strtotime($row['fecha_creacion_pedido'])) . '</td>';
-        echo '<td>' . date('d/m/Y', strtotime($row['fecha_ultimo_estado'])) . '</td>';
-        echo '<td>' . $row['año'] . '</td>';
-        echo '<td>' . $row['cantidad_vendida'] . '</td>';
+        if ($view_mode === 'detailed') {
+            echo '<td>' . $row['id_order'] . '</td>';
+            echo '<td>' . htmlspecialchars($row['referencia']) . '</td>';
+            echo '<td>' . htmlspecialchars($row['nombre_producto']) . '</td>';
+            echo '<td>' . date('d/m/Y H:i', strtotime($row['fecha_creacion_pedido'])) . '</td>';
+            echo '<td>' . date('d/m/Y H:i', strtotime($row['fecha_ultimo_estado'])) . '</td>';
+            echo '<td>' . htmlspecialchars($row['estado_pedido']) . '</td>';
+            echo '<td>' . $row['año'] . '</td>';
+            echo '<td>' . $row['cantidad_vendida'] . '</td>';
+        } else {
+            echo '<td>' . htmlspecialchars($row['referencia']) . '</td>';
+            echo '<td>' . htmlspecialchars($row['nombre_producto']) . '</td>';
+            echo '<td>' . $row['año'] . '</td>';
+            echo '<td>' . $row['cantidad_vendida'] . '</td>';
+        }
         echo '</tr>';
     }
-    
+
     echo '</tbody>';
     echo '</table>';
     exit;
@@ -403,11 +480,6 @@ if ($export && !empty($results)) {
                                 Fecha de Creación del Pedido (cuándo se creó)
                             </option>
                         </select>
-                        <div style="margin-top: 8px; padding: 10px; background: #e3f2fd; border-left: 3px solid #2196f3; font-size: 12px; border-radius: 3px;">
-                            <strong>💡 Nota:</strong> Un pedido creado en 2024 puede cambiar a estado "cancelado" en 2025.
-                            Por eso, el mismo pedido puede aparecer en diferentes años según el tipo de fecha seleccionado.
-                            <span style="color: #dc3545; font-weight: bold;"> ⚠️</span> indica cuando las fechas están en años diferentes.
-                        </div>
                     </div>
                 </div>
                 
@@ -452,7 +524,26 @@ if ($export && !empty($results)) {
                         </div>
                     </div>
                 </div>
-                
+
+                <div class="filter-row" style="margin-top: 20px; padding-top: 20px; border-top: 2px solid #ddd;">
+                    <div class="filter-group">
+                        <label for="view_mode">📋 Modo de Vista:</label>
+                        <select id="view_mode" name="view_mode" style="width: 100%; padding: 10px; border: 2px solid #007bff; border-radius: 4px; font-size: 14px; background: white; font-weight: 600;">
+                            <option value="grouped" <?php echo $view_mode === 'grouped' ? 'selected' : ''; ?>>
+                                📊 Vista Agrupada por Año (suma total por producto y año)
+                            </option>
+                            <option value="detailed" <?php echo $view_mode === 'detailed' ? 'selected' : ''; ?>>
+                                🔍 Vista Detallada por Pedido (muestra ID de cada pedido)
+                            </option>
+                        </select>
+                        <div style="margin-top: 8px; padding: 10px; background: #fff3cd; border-left: 3px solid #ffc107; font-size: 12px; border-radius: 3px;">
+                            <strong>ℹ️ Diferencia:</strong>
+                            <strong>Vista Agrupada</strong> suma todas las unidades del mismo producto en el mismo año.
+                            <strong>Vista Detallada</strong> muestra cada pedido individual con su ID para que puedas verificar los datos.
+                        </div>
+                    </div>
+                </div>
+
                 <div class="button-group">
                     <button type="submit" class="btn-primary">🔍 Buscar</button>
                     <button type="submit" name="export" value="1" class="btn-success">📥 Exportar a Excel</button>
@@ -487,37 +578,60 @@ if ($export && !empty($results)) {
             <table>
                 <thead>
                     <tr>
-                        <th>Referencia</th>
-                        <th>Nombre del Producto</th>
-                        <th>Fecha Creación Pedido</th>
-                        <th>Fecha Último Estado</th>
-                        <th>Año (Agrupación <?php echo $date_type === 'order_date' ? 'Creación' : 'Estado'; ?>)</th>
-                        <th>Cantidad Vendida</th>
+                        <?php if ($view_mode === 'detailed'): ?>
+                            <th>ID Pedido</th>
+                            <th>Referencia</th>
+                            <th>Nombre del Producto</th>
+                            <th>Fecha Creación</th>
+                            <th>Fecha Último Estado</th>
+                            <th>Estado</th>
+                            <th>Año (<?php echo $date_type === 'order_date' ? 'Creación' : 'Estado'; ?>)</th>
+                            <th>Cantidad</th>
+                        <?php else: ?>
+                            <th>Referencia</th>
+                            <th>Nombre del Producto</th>
+                            <th>Año (<?php echo $date_type === 'order_date' ? 'Creación' : 'Estado'; ?>)</th>
+                            <th>Cantidad Total</th>
+                        <?php endif; ?>
                     </tr>
                 </thead>
                 <tbody>
                     <?php foreach ($results as $row): ?>
                         <tr>
-                            <td>
-                                <strong><?php echo htmlspecialchars($row['referencia']); ?></strong>
-                                <?php if ($row['referencia'] == $row['nombre_producto']): ?>
-                                    <span style="color: #dc3545; font-size: 11px;"> (sin ref.)</span>
-                                <?php endif; ?>
-                            </td>
-                            <td><?php echo htmlspecialchars($row['nombre_producto']); ?></td>
-                            <td><?php echo date('d/m/Y', strtotime($row['fecha_creacion_pedido'])); ?></td>
-                            <td>
-                                <?php echo date('d/m/Y', strtotime($row['fecha_ultimo_estado'])); ?>
-                                <?php if ($row['año_creacion'] != $row['año_estado']): ?>
-                                    <span style="color: #dc3545; font-weight: bold;"> ⚠️</span>
-                                <?php endif; ?>
-                            </td>
-                            <td><strong><?php echo $row['año']; ?></strong></td>
-                            <td><strong><?php echo number_format($row['cantidad_vendida'], 0, ',', '.'); ?></strong></td>
+                            <?php if ($view_mode === 'detailed'): ?>
+                                <td><strong style="color: #007bff;"><?php echo $row['id_order']; ?></strong></td>
+                                <td>
+                                    <strong><?php echo htmlspecialchars($row['referencia']); ?></strong>
+                                    <?php if ($row['referencia'] == $row['nombre_producto']): ?>
+                                        <span style="color: #dc3545; font-size: 11px;"> (sin ref.)</span>
+                                    <?php endif; ?>
+                                </td>
+                                <td><?php echo htmlspecialchars($row['nombre_producto']); ?></td>
+                                <td><?php echo date('d/m/Y H:i', strtotime($row['fecha_creacion_pedido'])); ?></td>
+                                <td>
+                                    <?php echo date('d/m/Y H:i', strtotime($row['fecha_ultimo_estado'])); ?>
+                                    <?php if ($row['año_creacion'] != $row['año_estado']): ?>
+                                        <span style="color: #dc3545; font-weight: bold;"> ⚠️</span>
+                                    <?php endif; ?>
+                                </td>
+                                <td><?php echo htmlspecialchars($row['estado_pedido']); ?></td>
+                                <td><strong><?php echo $row['año']; ?></strong></td>
+                                <td><strong><?php echo number_format($row['cantidad_vendida'], 0, ',', '.'); ?></strong></td>
+                            <?php else: ?>
+                                <td>
+                                    <strong><?php echo htmlspecialchars($row['referencia']); ?></strong>
+                                    <?php if ($row['referencia'] == $row['nombre_producto']): ?>
+                                        <span style="color: #dc3545; font-size: 11px;"> (sin ref.)</span>
+                                    <?php endif; ?>
+                                </td>
+                                <td><?php echo htmlspecialchars($row['nombre_producto']); ?></td>
+                                <td><strong><?php echo $row['año']; ?></strong></td>
+                                <td><strong><?php echo number_format($row['cantidad_vendida'], 0, ',', '.'); ?></strong></td>
+                            <?php endif; ?>
                         </tr>
                     <?php endforeach; ?>
                     <tr class="total-row">
-                        <td colspan="5"><strong>TOTAL</strong></td>
+                        <td colspan="<?php echo $view_mode === 'detailed' ? '7' : '3'; ?>"><strong>TOTAL</strong></td>
                         <td><strong><?php echo number_format($total_cantidad, 0, ',', '.'); ?></strong></td>
                     </tr>
                 </tbody>
