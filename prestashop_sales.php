@@ -131,17 +131,17 @@ $stmt = $pdo->prepare("SELECT id_order_state, name FROM {$db_prefix}order_state_
 $stmt->execute();
 $order_states = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
-// Procesar formulario
-$selected_states = isset($_POST['states']) ? $_POST['states'] : [];
-$search_product = isset($_POST['search_product']) ? trim($_POST['search_product']) : '';
-$selected_years = isset($_POST['years']) ? $_POST['years'] : [];
-$date_type = isset($_POST['date_type']) ? $_POST['date_type'] : 'last_state';
-$view_mode = isset($_POST['view_mode']) ? $_POST['view_mode'] : 'grouped'; // 'grouped' o 'detailed'
-$export = isset($_POST['export']) ? true : false;
+// Procesar formulario (ahora todo por GET para preservar filtros en paginación)
+$selected_states = isset($_GET['states']) ? $_GET['states'] : [];
+$search_product = isset($_GET['search_product']) ? trim($_GET['search_product']) : '';
+$selected_years = isset($_GET['years']) ? $_GET['years'] : [];
+$date_type = isset($_GET['date_type']) ? $_GET['date_type'] : 'last_state';
+$view_mode = isset($_GET['view_mode']) ? $_GET['view_mode'] : 'grouped'; // 'grouped', 'unified' o 'detailed'
+$export = isset($_GET['export']) ? true : false;
 
 // Paginación y ordenamiento
 $page = isset($_GET['page']) ? max(1, intval($_GET['page'])) : 1;
-$limit = isset($_POST['limit']) ? intval($_POST['limit']) : 100;
+$limit = isset($_GET['limit']) ? intval($_GET['limit']) : 100;
 $order_by = isset($_GET['order_by']) ? $_GET['order_by'] : '';
 $order_dir = isset($_GET['order_dir']) && $_GET['order_dir'] === 'DESC' ? 'DESC' : 'ASC';
 
@@ -352,6 +352,9 @@ function getSortUrl($column) {
     } else {
         $params['order_dir'] = 'ASC';
     }
+
+    // Resetear a página 1 cuando se cambia el ordenamiento
+    $params['page'] = 1;
 
     return '?' . http_build_query($params);
 }
@@ -733,6 +736,23 @@ if ($export && !empty($results)) {
             var content = element.nextElementSibling;
             content.classList.toggle('active');
         }
+
+        function resetPageOnSubmit() {
+            // Eliminar el parámetro 'page' de la URL cuando se envía el formulario
+            // para que siempre empiece desde la página 1
+            var form = document.getElementById('filterForm');
+            var url = new URL(form.action || window.location.href);
+
+            // Si existe un input hidden para 'page', eliminarlo
+            var pageInputs = form.querySelectorAll('input[name="page"]');
+            pageInputs.forEach(function(input) {
+                input.remove();
+            });
+
+            // Eliminar 'page' y 'order_by' de la URL actual para que inicie desde página 1
+            // al hacer una nueva búsqueda
+            return true;
+        }
     </script>
 </head>
 <body>
@@ -743,7 +763,7 @@ if ($export && !empty($results)) {
             </span>
         </h1>
 
-        <form method="POST" action="">
+        <form method="GET" action="" id="filterForm" onsubmit="resetPageOnSubmit()">
             <div class="filter-section">
                 <h3 style="margin-bottom: 15px; color: #333;">Filtros de Búsqueda</h3>
                 
@@ -1058,7 +1078,7 @@ if ($export && !empty($results)) {
                 </div>
             <?php endif; ?>
 
-        <?php elseif ($_SERVER['REQUEST_METHOD'] === 'POST'): ?>
+        <?php elseif (!empty($_GET) && (isset($_GET['states']) || isset($_GET['years']) || isset($_GET['search_product']))): ?>
             <div class="no-results">
                 ❌ No se encontraron resultados con los filtros aplicados
             </div>
