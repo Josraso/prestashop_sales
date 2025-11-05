@@ -152,8 +152,16 @@ if (!in_array($limit, [50, 100, 200, 500])) {
 
 $offset = ($page - 1) * $limit;
 
-// Obtener años disponibles
-$stmt_years = $pdo->prepare("SELECT DISTINCT YEAR(date_add) AS year FROM {$db_prefix}orders ORDER BY year DESC");
+// Obtener años disponibles dinámicamente (tanto de creación como de estados)
+$stmt_years = $pdo->prepare("
+    SELECT DISTINCT year
+    FROM (
+        SELECT DISTINCT YEAR(o.date_add) AS year FROM {$db_prefix}orders o
+        UNION
+        SELECT DISTINCT YEAR(oh.date_add) AS year FROM {$db_prefix}order_history oh
+    ) AS all_years
+    ORDER BY year DESC
+");
 $stmt_years->execute();
 $available_years = $stmt_years->fetchAll(PDO::FETCH_COLUMN);
 
@@ -244,6 +252,43 @@ if ($view_mode === 'detailed') {
         $sql .= " ORDER BY " . $valid_columns_detailed[$order_by] . " $order_dir";
     } else {
         $sql .= " ORDER BY o.id_order DESC";
+    }
+
+    $sql .= " LIMIT $limit OFFSET $offset";
+
+} elseif ($view_mode === 'unified') {
+    // VISTA UNIFICADA: Agrupa por producto SIN separar por año (suma todos los años seleccionados)
+
+    // Primero contar total de registros (grupos)
+    $sql_count = "SELECT COUNT(*) as total FROM (
+        SELECT
+            COALESCE(NULLIF(p.reference, ''), pl.name) AS referencia
+        $base_from
+        $where_clause
+        GROUP BY COALESCE(NULLIF(p.reference, ''), pl.name), pl.name
+    ) AS subquery";
+
+    $stmt_count = $pdo->prepare($sql_count);
+    $stmt_count->execute($params);
+    $total_records = $stmt_count->fetch(PDO::FETCH_ASSOC)['total'];
+
+    // Consulta principal con paginación
+    $sql = "SELECT
+        COALESCE(NULLIF(p.reference, ''), pl.name) AS referencia,
+        pl.name AS nombre_producto,
+        SUM(od.product_quantity) AS cantidad_vendida
+    $base_from
+    $where_clause
+    GROUP BY COALESCE(NULLIF(p.reference, ''), pl.name), pl.name";
+
+    // Ordenamiento dinámico
+    $valid_columns_unified = ['referencia' => 'referencia', 'nombre_producto' => 'nombre_producto',
+                              'cantidad_vendida' => 'cantidad_vendida'];
+
+    if (!empty($order_by) && isset($valid_columns_unified[$order_by])) {
+        $sql .= " ORDER BY " . $valid_columns_unified[$order_by] . " $order_dir";
+    } else {
+        $sql .= " ORDER BY cantidad_vendida DESC";
     }
 
     $sql .= " LIMIT $limit OFFSET $offset";
@@ -342,6 +387,10 @@ if ($export && !empty($results)) {
         echo '<th>Estado</th>';
         echo '<th>Año (' . ($date_type === 'order_date' ? 'Creación' : 'Estado') . ')</th>';
         echo '<th>Cantidad</th>';
+    } elseif ($view_mode === 'unified') {
+        echo '<th>Referencia</th>';
+        echo '<th>Nombre Producto</th>';
+        echo '<th>Cantidad Total (Todos los años)</th>';
     } else {
         echo '<th>Referencia</th>';
         echo '<th>Nombre Producto</th>';
@@ -362,6 +411,10 @@ if ($export && !empty($results)) {
             echo '<td>' . date('d/m/Y H:i', strtotime($row['fecha_ultimo_estado'])) . '</td>';
             echo '<td>' . htmlspecialchars($row['estado_pedido']) . '</td>';
             echo '<td>' . $row['año'] . '</td>';
+            echo '<td>' . $row['cantidad_vendida'] . '</td>';
+        } elseif ($view_mode === 'unified') {
+            echo '<td>' . htmlspecialchars($row['referencia']) . '</td>';
+            echo '<td>' . htmlspecialchars($row['nombre_producto']) . '</td>';
             echo '<td>' . $row['cantidad_vendida'] . '</td>';
         } else {
             echo '<td>' . htmlspecialchars($row['referencia']) . '</td>';
@@ -761,7 +814,10 @@ if ($export && !empty($results)) {
                         <label for="view_mode">📋 Modo de Vista:</label>
                         <select id="view_mode" name="view_mode" style="width: 100%; padding: 10px; border: 2px solid #007bff; border-radius: 4px; font-size: 14px; background: white; font-weight: 600;">
                             <option value="grouped" <?php echo $view_mode === 'grouped' ? 'selected' : ''; ?>>
-                                📊 Vista Agrupada por Año (suma total por producto y año)
+                                📊 Vista Agrupada por Año (muestra producto separado por cada año)
+                            </option>
+                            <option value="unified" <?php echo $view_mode === 'unified' ? 'selected' : ''; ?>>
+                                🎯 Vista Unificada (suma TODOS los años seleccionados por producto)
                             </option>
                             <option value="detailed" <?php echo $view_mode === 'detailed' ? 'selected' : ''; ?>>
                                 🔍 Vista Detallada por Pedido (muestra ID de cada pedido)
@@ -795,16 +851,24 @@ if ($export && !empty($results)) {
             $años = array_unique(array_column($results, 'año'));
 
             // Calcular totales generales (todas las páginas)
-            $sql_totals = "SELECT
-                COUNT(" . ($view_mode === 'detailed' ? '*' : 'DISTINCT COALESCE(NULLIF(p.reference, \'\'), pl.name)') . ") as total_productos,
-                SUM(od.product_quantity) as total_cantidad
-            $base_from
-            $where_clause";
-
             if ($view_mode === 'grouped') {
-                // Para vista agrupada, necesitamos contar grupos únicos
+                // Para vista agrupada, necesitamos contar grupos únicos (producto + año)
                 $sql_totals = "SELECT
                     COUNT(DISTINCT CONCAT(COALESCE(NULLIF(p.reference, ''), pl.name), '-', " . ($date_type === 'order_date' ? 'YEAR(o.date_add)' : 'YEAR(oh.date_add)') . ")) as total_productos,
+                    SUM(od.product_quantity) as total_cantidad
+                $base_from
+                $where_clause";
+            } elseif ($view_mode === 'unified') {
+                // Para vista unificada, contar solo productos únicos (sin año)
+                $sql_totals = "SELECT
+                    COUNT(DISTINCT COALESCE(NULLIF(p.reference, ''), pl.name)) as total_productos,
+                    SUM(od.product_quantity) as total_cantidad
+                $base_from
+                $where_clause";
+            } else {
+                // Para vista detallada, contar todos los registros
+                $sql_totals = "SELECT
+                    COUNT(*) as total_productos,
                     SUM(od.product_quantity) as total_cantidad
                 $base_from
                 $where_clause";
@@ -852,6 +916,10 @@ if ($export && !empty($results)) {
                             <th class="sortable"><a href="<?php echo getSortUrl('estado_pedido'); ?>">Estado<?php echo getSortIcon('estado_pedido'); ?></a></th>
                             <th class="sortable"><a href="<?php echo getSortUrl('año'); ?>">Año (<?php echo $date_type === 'order_date' ? 'Creación' : 'Estado'; ?>)<?php echo getSortIcon('año'); ?></a></th>
                             <th class="sortable"><a href="<?php echo getSortUrl('cantidad_vendida'); ?>">Cantidad<?php echo getSortIcon('cantidad_vendida'); ?></a></th>
+                        <?php elseif ($view_mode === 'unified'): ?>
+                            <th class="sortable"><a href="<?php echo getSortUrl('referencia'); ?>">Referencia<?php echo getSortIcon('referencia'); ?></a></th>
+                            <th class="sortable"><a href="<?php echo getSortUrl('nombre_producto'); ?>">Nombre del Producto<?php echo getSortIcon('nombre_producto'); ?></a></th>
+                            <th class="sortable"><a href="<?php echo getSortUrl('cantidad_vendida'); ?>">Cantidad Total (Todos los años)<?php echo getSortIcon('cantidad_vendida'); ?></a></th>
                         <?php else: ?>
                             <th class="sortable"><a href="<?php echo getSortUrl('referencia'); ?>">Referencia<?php echo getSortIcon('referencia'); ?></a></th>
                             <th class="sortable"><a href="<?php echo getSortUrl('nombre_producto'); ?>">Nombre del Producto<?php echo getSortIcon('nombre_producto'); ?></a></th>
@@ -882,6 +950,15 @@ if ($export && !empty($results)) {
                                 <td><?php echo htmlspecialchars($row['estado_pedido']); ?></td>
                                 <td><strong><?php echo $row['año']; ?></strong></td>
                                 <td><strong><?php echo number_format($row['cantidad_vendida'], 0, ',', '.'); ?></strong></td>
+                            <?php elseif ($view_mode === 'unified'): ?>
+                                <td>
+                                    <strong><?php echo htmlspecialchars($row['referencia']); ?></strong>
+                                    <?php if ($row['referencia'] == $row['nombre_producto']): ?>
+                                        <span style="color: #dc3545; font-size: 11px;"> (sin ref.)</span>
+                                    <?php endif; ?>
+                                </td>
+                                <td><?php echo htmlspecialchars($row['nombre_producto']); ?></td>
+                                <td><strong><?php echo number_format($row['cantidad_vendida'], 0, ',', '.'); ?></strong></td>
                             <?php else: ?>
                                 <td>
                                     <strong><?php echo htmlspecialchars($row['referencia']); ?></strong>
@@ -896,7 +973,7 @@ if ($export && !empty($results)) {
                         </tr>
                     <?php endforeach; ?>
                     <tr class="total-row">
-                        <td colspan="<?php echo $view_mode === 'detailed' ? '7' : '3'; ?>">
+                        <td colspan="<?php echo $view_mode === 'detailed' ? '7' : ($view_mode === 'unified' ? '2' : '3'); ?>">
                             <strong>TOTAL DE ESTA PÁGINA</strong>
                             <span style="font-size: 11px; font-weight: normal; margin-left: 10px;">
                                 (Total general: <?php echo number_format($total_cantidad, 0, ',', '.'); ?> unidades)
