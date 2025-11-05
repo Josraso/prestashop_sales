@@ -2,21 +2,128 @@
 /**
  * Script de Ventas PrestaShop
  * Listado de ventas por producto agrupadas por año
+ * Compatible con PrestaShop 1.6 y PrestaShop 8+
  */
 
-// Configuración de la base de datos
-$db_host = 'localhost';
-$db_name = 'nombre_base_datos';
-$db_user = 'usuario';
-$db_pass = 'contraseña';
-$db_prefix = 'ps_'; // Prefijo de las tablas
+// Función para detectar y cargar configuración de PrestaShop automáticamente
+function loadPrestaShopConfig() {
+    $config = [
+        'db_host' => 'localhost',
+        'db_name' => null,
+        'db_user' => null,
+        'db_pass' => null,
+        'db_prefix' => 'ps_',
+        'ps_version' => 'desconocida',
+        'config_found' => false
+    ];
+
+    // Intentar detectar la raíz de PrestaShop
+    // El script puede estar en la raíz o en un subdirectorio
+    $possible_paths = [
+        __DIR__,                    // Mismo directorio que el script
+        dirname(__DIR__),           // Un nivel arriba
+        dirname(dirname(__DIR__))   // Dos niveles arriba
+    ];
+
+    foreach ($possible_paths as $base_path) {
+        // PrestaShop 8+ (app/config/parameters.php)
+        $ps8_config = $base_path . '/app/config/parameters.php';
+        if (file_exists($ps8_config)) {
+            $parameters = require $ps8_config;
+
+            if (isset($parameters['parameters'])) {
+                $params = $parameters['parameters'];
+                $config['db_host'] = $params['database_host'] ?? 'localhost';
+                $config['db_name'] = $params['database_name'] ?? null;
+                $config['db_user'] = $params['database_user'] ?? null;
+                $config['db_pass'] = $params['database_password'] ?? null;
+                $config['db_prefix'] = $params['database_prefix'] ?? 'ps_';
+                $config['ps_version'] = '8+';
+                $config['config_found'] = true;
+                $config['config_path'] = $ps8_config;
+                break;
+            }
+        }
+
+        // PrestaShop 1.6 (config/settings.inc.php)
+        $ps16_config = $base_path . '/config/settings.inc.php';
+        if (file_exists($ps16_config)) {
+            // Incluir el archivo para cargar las constantes
+            require_once $ps16_config;
+
+            if (defined('_DB_SERVER_')) {
+                $config['db_host'] = _DB_SERVER_;
+                $config['db_name'] = _DB_NAME_;
+                $config['db_user'] = _DB_USER_;
+                $config['db_pass'] = _DB_PASSWD_;
+                $config['db_prefix'] = _DB_PREFIX_;
+                $config['ps_version'] = '1.6';
+                $config['config_found'] = true;
+                $config['config_path'] = $ps16_config;
+                break;
+            }
+        }
+    }
+
+    return $config;
+}
+
+// Cargar configuración automáticamente
+$ps_config = loadPrestaShopConfig();
+
+if (!$ps_config['config_found']) {
+    die('
+    <div style="font-family: Arial; padding: 20px; max-width: 800px; margin: 50px auto; border: 2px solid #dc3545; border-radius: 8px; background: #f8d7da;">
+        <h2 style="color: #721c24; margin-top: 0;">❌ Error: No se encontró la configuración de PrestaShop</h2>
+        <p style="color: #721c24;">
+            No se pudo detectar automáticamente la configuración de PrestaShop.
+            Asegúrate de que este script esté en la carpeta raíz de PrestaShop o en un subdirectorio.
+        </p>
+        <h3 style="color: #721c24;">Ubicaciones buscadas:</h3>
+        <ul style="color: #721c24;">
+            <li><code>./app/config/parameters.php</code> (PrestaShop 8+)</li>
+            <li><code>./config/settings.inc.php</code> (PrestaShop 1.6)</li>
+            <li><code>../app/config/parameters.php</code></li>
+            <li><code>../config/settings.inc.php</code></li>
+            <li><code>../../app/config/parameters.php</code></li>
+            <li><code>../../config/settings.inc.php</code></li>
+        </ul>
+        <h3 style="color: #721c24;">Solución manual:</h3>
+        <p style="color: #721c24;">
+            Si necesitas configurar manualmente, edita este archivo y reemplaza la función <code>loadPrestaShopConfig()</code>
+            con las credenciales de tu base de datos.
+        </p>
+    </div>
+    ');
+}
+
+// Extraer configuración
+$db_host = $ps_config['db_host'];
+$db_name = $ps_config['db_name'];
+$db_user = $ps_config['db_user'];
+$db_pass = $ps_config['db_pass'];
+$db_prefix = $ps_config['db_prefix'];
 
 // Conexión a la base de datos
 try {
     $pdo = new PDO("mysql:host=$db_host;dbname=$db_name;charset=utf8", $db_user, $db_pass);
     $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
 } catch(PDOException $e) {
-    die("Error de conexión: " . $e->getMessage());
+    die('
+    <div style="font-family: Arial; padding: 20px; max-width: 800px; margin: 50px auto; border: 2px solid #dc3545; border-radius: 8px; background: #f8d7da;">
+        <h2 style="color: #721c24; margin-top: 0;">❌ Error de conexión a la base de datos</h2>
+        <p style="color: #721c24;"><strong>Mensaje:</strong> ' . htmlspecialchars($e->getMessage()) . '</p>
+        <h3 style="color: #721c24;">Configuración detectada:</h3>
+        <ul style="color: #721c24;">
+            <li><strong>Versión PrestaShop:</strong> ' . htmlspecialchars($ps_config['ps_version']) . '</li>
+            <li><strong>Archivo de configuración:</strong> ' . htmlspecialchars($ps_config['config_path'] ?? 'N/A') . '</li>
+            <li><strong>Host:</strong> ' . htmlspecialchars($db_host) . '</li>
+            <li><strong>Base de datos:</strong> ' . htmlspecialchars($db_name) . '</li>
+            <li><strong>Usuario:</strong> ' . htmlspecialchars($db_user) . '</li>
+            <li><strong>Prefijo:</strong> ' . htmlspecialchars($db_prefix) . '</li>
+        </ul>
+    </div>
+    ');
 }
 
 // Obtener estados de pedidos
@@ -577,8 +684,12 @@ if ($export && !empty($results)) {
 </head>
 <body>
     <div class="container">
-        <h1>📊 Ventas por Producto</h1>
-        
+        <h1>📊 Ventas por Producto
+            <span style="font-size: 14px; background: #28a745; color: white; padding: 5px 12px; border-radius: 4px; margin-left: 10px; vertical-align: middle; font-weight: normal;">
+                ✓ PrestaShop <?php echo htmlspecialchars($ps_config['ps_version']); ?> detectado
+            </span>
+        </h1>
+
         <form method="POST" action="">
             <div class="filter-section">
                 <h3 style="margin-bottom: 15px; color: #333;">Filtros de Búsqueda</h3>
